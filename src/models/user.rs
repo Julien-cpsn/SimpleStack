@@ -8,13 +8,3 @@ pub struct User {
     pub password: String,
     //pub images: Vec<Image>
 }
-
-impl User {
-    pub fn new(username: String, password: String) -> Self {
-        Self {
-            uuid: Uuid::new_v4(),
-            username,
-            password,
-        }
-    }
-}

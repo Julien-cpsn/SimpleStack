@@ -1,0 +1,277 @@
+use std::time::{SystemTime, UNIX_EPOCH};
+use argon2::Argon2;
+use axum::{Json, Extension};
+use axum::extract::{Request, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::http::header::AUTHORIZATION;
+use axum::middleware::Next;
+use axum::response::Response;
+use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
+use once_cell::sync::Lazy;
+use password_hash::{PasswordHasher, PasswordVerifier};
+use password_hash::phc::{PasswordHash, SaltString};
+use serde::{Deserialize, Serialize};
+use sqlx::{FromRow, SqlitePool, Type};
+use uuid::Uuid;
+use crate::info;
+use crate::server::{ServerError, ServerState};
+
+
+const TARGET: &str = "auth";
+
+pub const SESSION_COOKIE: &str = "session";
+const SESSION_TTL_SECS: i64 = 60 * 60 * 24 * 7; // 7 days
+
+// ---------------------------------------------------------------- models ---
+
+/// The authenticated user. Never contains the password hash.
+#[derive(Debug, Clone, Serialize, FromRow)]
+pub struct User {
+    pub id: Uuid,
+    pub username: String,
+    pub role: Role,
+}
+
+#[derive(FromRow)]
+struct UserWithHash {
+    id: Uuid,
+    username: String,
+    role: Role,
+    password_hash: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub enum Role {
+    User,
+    Admin,
+}
+
+// -------------------------------------------------------------- passwords ---
+
+async fn hash_password(password: String) -> Result<String, ServerError> {
+    let hash = tokio::task::spawn_blocking(move || {
+        let salt = SaltString::generate();
+        Argon2::default()
+            .hash_password_with_salt(password.as_bytes(), salt.as_bytes())
+            .map(|h| h.to_string())
+            .map_err(|e| anyhow::anyhow!("password hashing failed: {e}"))
+    })
+        .await??;
+    Ok(hash)
+}
+
+async fn verify_password(password: String, hash: String) -> bool {
+    tokio::task::spawn_blocking(move || match PasswordHash::new(&hash) {
+        Ok(parsed) => Argon2::default()
+            .verify_password(password.as_bytes(), &parsed)
+            .is_ok(),
+        Err(_) => false,
+    })
+        .await
+        .unwrap_or(false)
+}
+
+/// Verified against when the username doesn't exist, so response time
+/// doesn't reveal which usernames are valid.
+static DUMMY_HASH: Lazy<String> = Lazy::new(|| {
+    let salt = SaltString::generate();
+    Argon2::default()
+        .hash_password_with_salt(b"dummy-password", salt.as_bytes())
+        .expect("dummy hash")
+        .to_string()
+});
+
+// --------------------------------------------------------------- sessions ---
+
+fn now() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64
+}
+
+fn new_token() -> String {
+    // 2 x 122 random bits from the OS CSPRNG.
+    format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
+}
+
+async fn create_session(db: &SqlitePool, user_id: Uuid) -> Result<String, ServerError> {
+    let token = new_token();
+    let created = now();
+    sqlx::query("INSERT INTO sessions (token, user_id, created_at, expires_at) VALUES (?1, ?2, ?3, ?4)")
+        .bind(&token)
+        .bind(user_id)
+        .bind(created)
+        .bind(created + SESSION_TTL_SECS)
+        .execute(db)
+        .await?;
+    Ok(token)
+}
+
+/// Removes expired sessions. Call periodically (see `main`).
+pub async fn purge_expired_sessions(db: &SqlitePool) -> Result<u64, sqlx::Error> {
+    Ok(sqlx::query("DELETE FROM sessions WHERE expires_at <= ?1")
+        .bind(now())
+        .execute(db)
+        .await?
+        .rows_affected())
+}
+
+fn extract_token(headers: &HeaderMap, jar: &CookieJar) -> Option<String> {
+    headers
+        .get(AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::to_owned)
+        .or_else(|| jar.get(SESSION_COOKIE).map(|c| c.value().to_owned()))
+}
+
+// ------------------------------------------------------------ middleware ---
+
+/// Runs before every protected request: validates the session, loads the
+/// user and inserts it into the request extensions.
+pub async fn require_auth(State(state): State<ServerState>, jar: CookieJar, mut req: Request, next: Next) -> Result<Response, ServerError> {
+    let token = extract_token(req.headers(), &jar).ok_or(ServerError::Unauthorized)?;
+
+    let user = sqlx::query_as::<_, User>(
+        "SELECT u.id, u.username, u.role
+           FROM sessions s JOIN users u ON u.id = s.user_id
+          WHERE s.token = ?1 AND s.expires_at > ?2",
+    )
+        .bind(&token)
+        .bind(now())
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or(ServerError::Unauthorized)?;
+
+    req.extensions_mut().insert(user);
+    Ok(next.run(req).await)
+}
+
+/// Must be layered *inside* `require_auth` (it reads the `User` extension).
+pub async fn require_admin(Extension(user): Extension<User>, req: Request, next: Next) -> Result<Response, ServerError> {
+    if user.role != Role::Admin {
+        return Err(ServerError::Forbidden);
+    }
+    Ok(next.run(req).await)
+}
+
+// ---------------------------------------------------------------- users ---
+
+pub async fn create_user_record(db: &SqlitePool, username: &str, password: &str, role: Role) -> Result<User, ServerError> {
+    let username = username.trim();
+    if !(3..=32).contains(&username.chars().count()) {
+        return Err(ServerError::BadRequest("username must be 3-32 characters".into()));
+    }
+    if password.len() < 8 {
+        return Err(ServerError::BadRequest("password must be at least 8 characters".into()));
+    }
+
+    let id = Uuid::new_v4();
+    let hash = hash_password(password.to_owned()).await?;
+
+    sqlx::query("INSERT INTO users (id, username, password_hash, role, created_at) VALUES (?1, ?2, ?3, ?4, ?5)")
+        .bind(id)
+        .bind(username)
+        .bind(hash)
+        .bind(role)
+        .bind(now())
+        .execute(db)
+        .await
+        .map_err(|e| match e {
+            sqlx::Error::Database(d) if d.is_unique_violation() => {
+                ServerError::Conflict("username already taken".into())
+            }
+            other => other.into(),
+        })?;
+
+    Ok(User { id, username: username.to_owned(), role })
+}
+
+/// If the users table is empty, creates an admin from ADMIN_USERNAME / ADMIN_PASSWORD.
+pub async fn bootstrap_admin(db: &SqlitePool) -> anyhow::Result<()> {
+    let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users").fetch_one(db).await?;
+    if count > 0 {
+        return Ok(());
+    }
+
+    create_user_record(db, "admin", "superadmin", Role::Admin)
+        .await
+        .map_err(|e| anyhow::anyhow!("bootstrap admin failed: {e:?}"))?;
+
+    info!("created initial admin user \"admin\" \"admin\"");
+
+    Ok(())
+}
+
+// -------------------------------------------------------------- handlers ---
+
+#[derive(Deserialize)]
+pub struct LoginRequest {
+    username: String,
+    password: String,
+}
+
+#[derive(Serialize)]
+pub struct LoginResponse {
+    user: User,
+    /// Same value as the cookie; for non-browser clients (`Authorization: Bearer <token>`).
+    token: String,
+}
+
+pub async fn login(State(state): State<ServerState>, jar: CookieJar, Json(body): Json<LoginRequest>) -> Result<(CookieJar, Json<LoginResponse>), ServerError> {
+    let row = sqlx::query_as::<_, UserWithHash>(
+        "SELECT id, username, role, password_hash FROM users WHERE username = ?1",
+    )
+        .bind(body.username.trim())
+        .fetch_optional(&state.db)
+        .await?;
+
+    let (hash, row) = match row {
+        Some(r) => (r.password_hash.clone(), Some(r)),
+        None => (DUMMY_HASH.clone(), None),
+    };
+    let valid = verify_password(body.password, hash).await;
+
+    let row = match (valid, row) {
+        (true, Some(r)) => r,
+        _ => return Err(ServerError::Unauthorized),
+    };
+
+    let token = create_session(&state.db, row.id).await?;
+    let cookie = Cookie::build((SESSION_COOKIE, token.clone()))
+        .path("/")
+        .http_only(true)
+        .same_site(SameSite::Lax)
+        .secure(state.cookie_secure)
+        .max_age(time::Duration::seconds(SESSION_TTL_SECS))
+        .build();
+
+    let user = User { id: row.id, username: row.username, role: row.role };
+    Ok((jar.add(cookie), Json(LoginResponse { user, token })))
+}
+
+pub async fn logout(State(state): State<ServerState>, headers: HeaderMap, jar: CookieJar) -> Result<(CookieJar, StatusCode), ServerError> {
+    if let Some(token) = extract_token(&headers, &jar) {
+        sqlx::query("DELETE FROM sessions WHERE token = ?1")
+            .bind(token)
+            .execute(&state.db)
+            .await?;
+    }
+    let removal = Cookie::build((SESSION_COOKIE, "")).path("/").build();
+    Ok((jar.remove(removal), StatusCode::NO_CONTENT))
+}
+
+/// Example of a handler that receives the user.
+pub async fn me(Extension(user): Extension<User>) -> Json<User> {
+    Json(user)
+}
+
+#[derive(Deserialize)]
+pub struct NewUser {
+    username: String,
+    password: String,
+    role: Role,
+}
+
+pub async fn create_user(State(state): State<ServerState>, Json(body): Json<NewUser>) -> Result<(StatusCode, Json<User>), ServerError> {
+    let user = create_user_record(&state.db, &body.username, &body.password, body.role).await?;
+    Ok((StatusCode::CREATED, Json(user)))
+}
