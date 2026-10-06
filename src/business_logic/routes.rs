@@ -40,7 +40,7 @@ pub fn define_routes(server_state: ServerState) -> Router {
         .allow_methods([Method::GET, Method::POST]);
 
     let admin = Router::new()
-        .route("/new-user", post(create_user))
+        .route_with_map(&mut routes, "/new-user", post(create_user))
         .route_with_map(&mut routes, "/project-summary", get(get_project_summary))
         .route_layer(middleware::from_fn(require_admin));
 
@@ -48,8 +48,8 @@ pub fn define_routes(server_state: ServerState) -> Router {
         .route_with_map(&mut routes, "/", get(|| async { "Hello, World!" }))
         .route_with_map(&mut routes, "/my-images", get(list_user_images))
         .route_with_map(&mut routes, "/upload-image", post(upload_image))
-        .route("/logout", post(logout))
-        .route("/me", get(me))
+        .route_with_map(&mut routes, "/logout", post(logout))
+        .route_with_map(&mut routes, "/me", get(me))
         .merge(admin)
         .route_layer(middleware::from_fn_with_state(server_state.clone(), require_auth))
         .layer(cors)
