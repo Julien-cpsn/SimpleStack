@@ -13,6 +13,7 @@ tower-http = { version = "0.7.1", default-features = false, features = ["cors", 
 tokio = { version = "1.16.1", features = ["rt", "rt-multi-thread", "signal"] }
 
 sqlx = { version = "0.9.0", features = ["sqlite", "uuid", "runtime-tokio"] }
+sea-orm = { version = "2.0.4", default-features = false, features = ["sqlx-sqlite", "runtime-tokio-rustls", "macros", "with-uuid"] }
 
 anyhow = "1.0.104"
 once_cell = "1.21.4"

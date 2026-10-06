@@ -3,6 +3,7 @@ use crate::utils::gns3::connector::init_gns3_connector;
 use gns3fy_rs::{Gns3Connector};
 use once_cell::sync::{Lazy, OnceCell};
 use std::sync::Arc;
+use sea_orm::SqlxSqliteConnector;
 use tokio::net::TcpListener;
 use crate::business_logic::auth::{bootstrap_admin};
 use crate::business_logic::database::{init_database, purge_sessions};
@@ -35,10 +36,11 @@ async fn main() -> anyhow::Result<()> {
     create_temp_dir()?;
 
     let pool = init_database().await?;
+    let orm = SqlxSqliteConnector::from_sqlx_sqlite_pool(pool.clone());
     bootstrap_admin(&pool).await?;
     purge_sessions(pool.clone()).await;
 
-    let server = ServerState::new(pool, false);
+    let server = ServerState::new(pool, orm, false);
     let app  = define_routes(server);
 
     let listener = TcpListener::bind("0.0.0.0:3000").await?;

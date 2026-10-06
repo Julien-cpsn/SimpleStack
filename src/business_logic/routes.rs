@@ -7,7 +7,7 @@ use axum::routing::{get, MethodRouter, post};
 use tower_http::cors::CorsLayer;
 use tower_http::timeout::TimeoutLayer;
 use crate::business_logic::auth::{create_user, login, logout, me, require_admin, require_auth};
-use crate::business_logic::image::{upload_image, MAX_UPLOAD_SIZE};
+use crate::business_logic::image::{upload_image, MAX_UPLOAD_SIZE, list_user_images};
 use crate::business_logic::project::get_project_summary;
 use crate::info;
 use crate::server::ServerState;
@@ -46,6 +46,7 @@ pub fn define_routes(server_state: ServerState) -> Router {
     let protected = Router::new()
         .route_with_map(&mut routes, "/", get(|| async { "Hello, World!" }))
         .route_with_map(&mut routes, "/project-summary", get(get_project_summary))
+        .route_with_map(&mut routes, "/my-images", get(list_user_images))
         .route_with_map(&mut routes, "/upload-image", post(upload_image))
         .route("/logout", post(logout))
         .route("/me", get(me))

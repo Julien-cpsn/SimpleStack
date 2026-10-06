@@ -1,22 +1,44 @@
 use std::path::PathBuf;
 use std::str::FromStr;
 use crate::utils::directories::TEMP_DIR;
-use axum::extract::Multipart;
+use axum::extract::{Multipart, State};
 use axum::extract::multipart::Field;
 use axum::http::StatusCode;
-use axum::response::IntoResponse;
-use axum_anyhow::{ApiError, ApiResult};
+use axum::{Extension, Json};
+use axum_anyhow::{conflict, ApiError, ApiResult, bad_request, internal_error};
+use sea_orm::{ActiveModelTrait, DatabaseConnection, Set, SqlErr, EntityTrait, QueryFilter, ColumnTrait};
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 use crate::{info, CONNECTOR};
-use crate::models::image::{Architecture, Image};
+use crate::models::image;
+use crate::models::image::Architecture;
+use crate::models::user::{User};
+use crate::server::{ServerState};
+use crate::utils::time::now;
 
 const TARGET: &str = "image";
 
 pub const MAX_UPLOAD_SIZE: u64 = 10 * 1024 * 1024 * 1024;
 
-pub async fn upload_image(mut multipart: Multipart) -> ApiResult<impl IntoResponse> {
+
+/// What the upload handler knows once the file has been stored in the GNS3 folder.
+pub struct NewOsImage {
+    pub filename: String,
+    pub stored_path: String,
+    pub size_bytes: u64,
+    pub architecture: Architecture
+}
+
+pub async fn list_user_images(State(state): State<ServerState>, Extension(user): Extension<User>) -> ApiResult<Json<Vec<image::Model>>> {
+    let images: Vec<image::Model> = image::Entity::find()
+        .filter(image::Column::UploadedBy.eq(user.id))
+        .all(&state.orm).await?;
+
+    Ok(Json(images))
+}
+
+pub async fn upload_image(State(state): State<ServerState>, Extension(user): Extension<User>, mut multipart: Multipart) -> ApiResult<Json<image::Model>> {
     let mut file_path = None;
     let mut file_name = None;
     let mut architecture = None;
@@ -24,7 +46,7 @@ pub async fn upload_image(mut multipart: Multipart) -> ApiResult<impl IntoRespon
     while let Some(mut field) = multipart
         .next_field()
         .await
-        .map_err(|e| ApiError::builder().status(StatusCode::BAD_REQUEST).title(e.to_string()).build())?
+        .map_err(|e| bad_request(e.to_string().as_str(), ""))?
     {
         match field.name() {
             Some("file") => {
@@ -39,7 +61,7 @@ pub async fn upload_image(mut multipart: Multipart) -> ApiResult<impl IntoRespon
                     Ok(archi) => {
                         architecture = Some(archi);
                     }
-                    Err(err) => return Err(ApiError::builder().status(StatusCode::BAD_REQUEST).title(err.to_string()).build())
+                    Err(err) => return Err(bad_request("Invalid input", err.to_string().as_str()))
                 }
             }
             _ => {}
@@ -49,8 +71,9 @@ pub async fn upload_image(mut multipart: Multipart) -> ApiResult<impl IntoRespon
 
     let file_path = file_path.unwrap();
     let file_name = file_name.unwrap();
+    let file_size = tokio::fs::metadata(&file_path).await?.len();
     let Some(architecture) = architecture else {
-        return Err(ApiError::builder().status(StatusCode::BAD_REQUEST).title("Missing architecture field").build());
+        return Err(bad_request("Invalid input", "Missing architecture field"));
     };
 
     let new_path = file_path.with_file_name(&file_name);
@@ -59,13 +82,13 @@ pub async fn upload_image(mut multipart: Multipart) -> ApiResult<impl IntoRespon
 
     if new_path.extension().is_none() {
         let _ = tokio::fs::remove_file(&new_path).await;
-        return Err(ApiError::builder().status(StatusCode::BAD_REQUEST).title("Image has no extension").build());
+        return Err(bad_request("Invalid input", "Image has no extension"));
     }
 
     if let Some(extension) = new_path.extension() {
         if !["qcow2", "raw", "img", "iso"].contains(&extension.to_str().unwrap()) {
             let _ = tokio::fs::remove_file(&new_path).await;
-            return Err(ApiError::builder().status(StatusCode::BAD_REQUEST).title("Image format not supported").build());
+            return Err(bad_request("Invalid input", "Image format not supported"));
         }
     }
 
@@ -75,27 +98,31 @@ pub async fn upload_image(mut multipart: Multipart) -> ApiResult<impl IntoRespon
     for image in images {
         if file_name == image.filename {
             let _ = tokio::fs::remove_file(&new_path).await;
-            return Err(ApiError::builder().status(StatusCode::BAD_REQUEST).title("Image already uploaded").build());
+            return Err(conflict("Conflict", "Image already uploaded"));
         }
     }
 
     if let Err(error) = connector.upload_compute_image("qemu", &new_path, "local").await {
         let _ = tokio::fs::remove_file(&new_path).await;
-        return Err(ApiError::builder().status(StatusCode::BAD_REQUEST).title(error.to_string()).build());
+        return Err(bad_request("Invalid input", error.to_string().as_str()));
     }
     else {
         let _ = tokio::fs::remove_file(&new_path).await;
     }
 
-    let image = Image {
-        name: file_name,
-        path: file_path,
-        architecture,
-    };
-
+    let image = record_upload(
+        &state.orm,
+        &user,
+        NewOsImage {
+            filename: file_name,
+            stored_path: file_path.to_string_lossy().to_string(),
+            size_bytes: file_size,
+            architecture,
+        },
+    ).await?;
     info!("New image: {:?}", image);
 
-    Ok(StatusCode::OK)
+    Ok(Json(image))
 }
 
 async fn handle_file_field(field: &mut Field<'_>) -> ApiResult<(PathBuf, String)> {
@@ -105,21 +132,21 @@ async fn handle_file_field(field: &mut Field<'_>) -> ApiResult<(PathBuf, String)
     let path = TEMP_DIR.join(Uuid::new_v4().to_string());
     let mut file = File::create(&path)
         .await
-        .map_err(|e| ApiError::builder().status(StatusCode::INTERNAL_SERVER_ERROR).title(e.to_string()).build())?;
+        .map_err(|e| internal_error("Internal server error", e.to_string().as_str()))?;
 
     if let Some(field_file_name) = field.file_name() {
         file_name = field_file_name.to_string();
     }
     else {
         let _ = tokio::fs::remove_file(&path).await;
-        return Err(ApiError::builder().status(StatusCode::BAD_REQUEST).title("File has no name").build());
+        return Err(bad_request("Invalid input", "File has no name"));
     }
 
     let mut size = 0u64;
     while let Some(chunk) = field
         .chunk()
         .await
-        .map_err(|e| ApiError::builder().status(StatusCode::BAD_REQUEST).title(e.to_string()).build())?
+        .map_err(|e| bad_request("Invalid input", e.to_string().as_str()))?
     {
         size += chunk.len() as u64;
 
@@ -136,7 +163,7 @@ async fn handle_file_field(field: &mut Field<'_>) -> ApiResult<(PathBuf, String)
 
         file.write_all(&chunk)
             .await
-            .map_err(|e| ApiError::builder().status(StatusCode::INTERNAL_SERVER_ERROR).title(e.to_string()).build())?;
+            .map_err(|e| internal_error("Invalid input", e.to_string().as_str()))?;
     }
 
     file_path = path;
@@ -144,4 +171,26 @@ async fn handle_file_field(field: &mut Field<'_>) -> ApiResult<(PathBuf, String)
 
 
     Ok((file_path, file_name))
+}
+
+/// Stores the metadata of an uploaded image and returns the saved row.
+async fn record_upload(orm: &DatabaseConnection, user: &User, image: NewOsImage) -> ApiResult<image::Model> {
+    let created_at = now();
+
+    let row = image::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        filename: Set(image.filename),
+        stored_path: Set(image.stored_path),
+        size_bytes: Set(i64::try_from(image.size_bytes)?),
+        uploaded_by: Set(Some(user.id)),
+        architecture: Set(image.architecture),
+        created_at: Set(created_at),
+    };
+
+    row.insert(orm).await.map_err(|e| match e.sql_err() {
+        Some(SqlErr::UniqueConstraintViolation(_)) => {
+            conflict("Conflict", "an image with this filename already exists")
+        }
+        _ => e.into(),
+    })
 }

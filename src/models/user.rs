@@ -1,10 +1,25 @@
 use serde::{Deserialize, Serialize};
+use sqlx::{FromRow, Type};
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// The authenticated user. Never contains the password hash.
+#[derive(Debug, Clone, Serialize, FromRow)]
 pub struct User {
-    pub uuid: Uuid,
+    pub id: Uuid,
     pub username: String,
-    pub password: String,
-    //pub images: Vec<Image>
+    pub role: Role,
+}
+
+#[derive(FromRow)]
+pub struct UserWithHash {
+    pub id: Uuid,
+    pub username: String,
+    pub role: Role,
+    pub password_hash: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub enum Role {
+    User,
+    Admin,
 }
