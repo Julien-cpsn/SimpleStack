@@ -8,6 +8,7 @@ pub struct User {
     pub id: Uuid,
     pub username: String,
     pub role: Role,
+    pub gns3_project_id: String
 }
 
 #[derive(FromRow)]

@@ -41,11 +41,11 @@ pub fn define_routes(server_state: ServerState) -> Router {
 
     let admin = Router::new()
         .route("/new-user", post(create_user))
+        .route_with_map(&mut routes, "/project-summary", get(get_project_summary))
         .route_layer(middleware::from_fn(require_admin));
 
     let protected = Router::new()
         .route_with_map(&mut routes, "/", get(|| async { "Hello, World!" }))
-        .route_with_map(&mut routes, "/project-summary", get(get_project_summary))
         .route_with_map(&mut routes, "/my-images", get(list_user_images))
         .route_with_map(&mut routes, "/upload-image", post(upload_image))
         .route("/logout", post(logout))

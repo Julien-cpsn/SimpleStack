@@ -5,17 +5,19 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::http::header::AUTHORIZATION;
 use axum::middleware::Next;
 use axum::response::Response;
-use axum_anyhow::{unauthorized, ApiResult, forbidden, bad_request, conflict};
+use axum_anyhow::{unauthorized, ApiResult, forbidden, bad_request, conflict, internal_error};
 use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
+use gns3fy_rs::{Lookup, Project};
 use once_cell::sync::Lazy;
 use password_hash::{PasswordHasher, PasswordVerifier};
 use password_hash::phc::{PasswordHash, SaltString};
 use serde::{Deserialize, Serialize};
-use sqlx::{SqlitePool, Type};
+use sqlx::{SqlitePool};
 use uuid::Uuid;
-use crate::info;
+use crate::{info, CONNECTOR};
 use crate::models::user::{Role, User, UserWithHash};
 use crate::server::{ServerState};
+use crate::utils::gns3::project::project_name;
 use crate::utils::time::now;
 
 const TARGET: &str = "auth";
@@ -105,7 +107,7 @@ pub async fn require_auth(State(state): State<ServerState>, jar: CookieJar, mut 
     let token = extract_token(req.headers(), &jar).ok_or(unauthorized("Unauthorized", ""))?;
 
     let user = sqlx::query_as::<_, User>(
-        "SELECT u.id, u.username, u.role
+        "SELECT u.id, u.username, u.role, u.gns3_project_id
            FROM sessions s JOIN users u ON u.id = s.user_id
           WHERE s.token = ?1 AND s.expires_at > ?2",
     )
@@ -129,7 +131,7 @@ pub async fn require_admin(Extension(user): Extension<User>, req: Request, next:
 
 // ---------------------------------------------------------------- users ---
 
-pub async fn create_user_record(db: &SqlitePool, username: &str, password: &str, role: Role) -> ApiResult<User> {
+async fn create_user_record(db: &SqlitePool, username: &str, password: &str, role: Role) -> ApiResult<User> {
     let username = username.trim();
     if !(3..=32).contains(&username.chars().count()) {
         return Err(bad_request("Bad request", "username must be 3-32 characters"));
@@ -141,11 +143,18 @@ pub async fn create_user_record(db: &SqlitePool, username: &str, password: &str,
     let id = Uuid::new_v4();
     let hash = hash_password(password.to_owned()).await?;
 
-    sqlx::query("INSERT INTO users (id, username, password_hash, role, created_at) VALUES (?1, ?2, ?3, ?4, ?5)")
+    let connector = CONNECTOR.clone();
+    let mut project = Project::with_connector(connector).with_name(project_name(username));
+    project.create().await?;
+
+    let project_id = project.project_id.unwrap();
+
+    sqlx::query("INSERT INTO users (id, username, password_hash, role, gns3_project_id, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)")
         .bind(id)
         .bind(username)
         .bind(hash)
         .bind(role)
+        .bind(&project_id)
         .bind(now())
         .execute(db)
         .await
@@ -156,7 +165,14 @@ pub async fn create_user_record(db: &SqlitePool, username: &str, password: &str,
             other => other.into(),
         })?;
 
-    Ok(User { id, username: username.to_owned(), role })
+    let user = User {
+        id,
+        username: username.to_owned(),
+        role,
+        gns3_project_id: project_id,
+    };
+
+    Ok(user)
 }
 
 /// If the users table is empty, creates an admin from ADMIN_USERNAME / ADMIN_PASSWORD.
@@ -218,7 +234,18 @@ pub async fn login(State(state): State<ServerState>, jar: CookieJar, Json(body):
         .max_age(time::Duration::seconds(SESSION_TTL_SECS))
         .build();
 
-    let user = User { id: row.id, username: row.username, role: row.role };
+    let connector = CONNECTOR.clone();
+    let Some(project) = connector.get_project(Lookup::Name(&project_name(row.username.as_str()))).await? else {
+        return Err(internal_error("No associated GNS3 project", "Please contact admins"));
+    };
+
+    let user = User {
+        id: row.id,
+        username: row.username,
+        role: row.role,
+        gns3_project_id: project.project_id.unwrap(),
+    };
+
     Ok((jar.add(cookie), Json(LoginResponse { user, token })))
 }
 

@@ -1,6 +1,7 @@
 use std::{str::FromStr, time::Duration};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::SqlitePool;
+use tokio::time::sleep;
 use crate::business_logic::auth::purge_expired_sessions;
 use crate::DATABASE_URL;
 
@@ -10,6 +11,7 @@ CREATE TABLE IF NOT EXISTS users (
     username      TEXT NOT NULL UNIQUE COLLATE NOCASE,
     password_hash TEXT NOT NULL,
     role          TEXT NOT NULL CHECK (role IN ('User', 'Admin')),
+    gns3_project_id TEXT NOT NULL,
     created_at    INTEGER NOT NULL
 );
 
@@ -56,7 +58,7 @@ pub async fn purge_sessions(purge_pool: SqlitePool) {
     tokio::spawn(async move {
         loop {
             let _ = purge_expired_sessions(&purge_pool).await;
-            tokio::time::sleep(Duration::from_secs(3600)).await;
+            sleep(Duration::from_secs(3600)).await;
         }
     });
 }
