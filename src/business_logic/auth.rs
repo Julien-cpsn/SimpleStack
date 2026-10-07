@@ -147,6 +147,7 @@ async fn create_user_record(db: &SqlitePool, username: &str, password: &str, rol
     let connector = CONNECTOR.clone();
     let mut project = Project::with_connector(connector).with_name(project_name(username));
     project.create().await?;
+    project.open().await?;
 
     let project_id = project.project_id.unwrap();
 

@@ -118,7 +118,7 @@ pub async fn upload_image(State(state): State<ServerState>, Extension(user): Ext
             architecture,
         },
     ).await?;
-    info!("New image: {:?}", image);
+    info!("New image \"{}\" for user {}", image.filename, user.username);
 
     Ok(Json(image))
 }
@@ -146,7 +146,7 @@ pub async fn delete_image(State(state): State<ServerState>, Extension(user): Ext
 
     image.delete(&state.orm).await?;
 
-    Ok((StatusCode::NO_CONTENT, String::from("Image deleted")))
+    Ok((StatusCode::OK, String::from("Image deleted")))
 }*/
 
 async fn handle_file_field(field: &mut Field<'_>) -> ApiResult<(PathBuf, String)> {

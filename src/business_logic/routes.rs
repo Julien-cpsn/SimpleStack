@@ -9,6 +9,7 @@ use tower_http::timeout::TimeoutLayer;
 use crate::business_logic::auth::{create_user, login, logout, me, require_admin, require_auth};
 use crate::business_logic::image::{upload_image, MAX_UPLOAD_SIZE, list_user_images};
 use crate::business_logic::project::get_project_summary;
+use crate::business_logic::vm::{create_vm, delete_vm, list_user_vms};
 use crate::info;
 use crate::server::ServerState;
 
@@ -47,9 +48,12 @@ pub fn define_routes(server_state: ServerState) -> Router {
     let protected = Router::new()
         .route_with_map(&mut routes, "/me", get(me))
         .route_with_map(&mut routes, "/logout", post(logout))
-        .route_with_map(&mut routes, "/my-images", get(list_user_images))
         .route_with_map(&mut routes, "/upload-image", post(upload_image))
         //.route_with_map(&mut routes, "/delete-image/{uuid}", get(delete_image))
+        .route_with_map(&mut routes, "/my-images", get(list_user_images))
+        .route_with_map(&mut routes, "/create-vm", post(create_vm))
+        .route_with_map(&mut routes, "/delete-vm/{name}", get(delete_vm))
+        .route_with_map(&mut routes, "/my-vms", get(list_user_vms))
         .merge(admin)
         .route_layer(middleware::from_fn_with_state(server_state.clone(), require_auth))
         .layer(cors)
