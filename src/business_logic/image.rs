@@ -25,7 +25,6 @@ pub const MAX_UPLOAD_SIZE: u64 = 10 * 1024 * 1024 * 1024;
 /// What the upload handler knows once the file has been stored in the GNS3 folder.
 pub struct NewOsImage {
     pub filename: String,
-    pub stored_path: String,
     pub size_bytes: u64,
     pub architecture: Architecture
 }
@@ -107,7 +106,7 @@ pub async fn upload_image(State(state): State<ServerState>, Extension(user): Ext
         return Err(bad_request("Invalid input", error.to_string().as_str()));
     }
     else {
-        let _ = tokio::fs::remove_file(&new_path).await;
+        let _ = tokio::fs::remove_file(&file_path).await;
     }
 
     let image = record_upload(
@@ -115,7 +114,6 @@ pub async fn upload_image(State(state): State<ServerState>, Extension(user): Ext
         &user,
         NewOsImage {
             filename: file_name,
-            stored_path: file_path.to_string_lossy().to_string(),
             size_bytes: file_size,
             architecture,
         },
@@ -124,6 +122,32 @@ pub async fn upload_image(State(state): State<ServerState>, Extension(user): Ext
 
     Ok(Json(image))
 }
+
+/*
+pub async fn delete_image(State(state): State<ServerState>, Extension(user): Extension<User>, Path(image_uuid): Path<Uuid>) -> ApiResult<(StatusCode, String)> {
+    let mut images: Vec<image::Model> = image::Entity::find()
+        .filter(image::Column::UploadedBy.eq(user.id))
+        .all(&state.orm).await?;
+
+    let image = images
+        .drain(..)
+        .find(|i| i.id == image_uuid)
+        .ok_or(not_found("Not found", "The requested image was not found"))?;
+
+    let connector = CONNECTOR.clone();
+
+    let gns3_images = connector.get_compute_images("qemu", "local").await?;
+    let gns3_image = gns3_images
+        .iter()
+        .find(|i| i.filename == image.filename)
+        .ok_or(not_found("Not found", "The requested image was not found in GNS3"))?;
+
+    // No way to delete an image using GNS3 v2
+
+    image.delete(&state.orm).await?;
+
+    Ok((StatusCode::NO_CONTENT, String::from("Image deleted")))
+}*/
 
 async fn handle_file_field(field: &mut Field<'_>) -> ApiResult<(PathBuf, String)> {
     let file_path;
@@ -180,7 +204,6 @@ async fn record_upload(orm: &DatabaseConnection, user: &User, image: NewOsImage)
     let row = image::ActiveModel {
         id: Set(Uuid::new_v4()),
         filename: Set(image.filename),
-        stored_path: Set(image.stored_path),
         size_bytes: Set(i64::try_from(image.size_bytes)?),
         uploaded_by: Set(Some(user.id)),
         architecture: Set(image.architecture),

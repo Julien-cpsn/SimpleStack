@@ -3,3 +3,4 @@ pub mod gns3;
 pub mod log;
 pub mod directories;
 pub mod time;
+pub mod user;

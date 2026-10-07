@@ -5,20 +5,21 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::http::header::AUTHORIZATION;
 use axum::middleware::Next;
 use axum::response::Response;
-use axum_anyhow::{unauthorized, ApiResult, forbidden, bad_request, conflict, internal_error};
+use axum_anyhow::{unauthorized, ApiResult, forbidden, bad_request, conflict};
 use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
-use gns3fy_rs::{Lookup, Project};
+use gns3fy_rs::{Project};
 use once_cell::sync::Lazy;
 use password_hash::{PasswordHasher, PasswordVerifier};
 use password_hash::phc::{PasswordHash, SaltString};
 use serde::{Deserialize, Serialize};
-use sqlx::{SqlitePool};
+use sqlx::{FromRow, SqlitePool};
 use uuid::Uuid;
 use crate::{info, CONNECTOR};
-use crate::models::user::{Role, User, UserWithHash};
+use crate::models::user::{Role, User};
 use crate::server::{ServerState};
 use crate::utils::gns3::project::project_name;
 use crate::utils::time::now;
+use crate::utils::user::get_user_project;
 
 const TARGET: &str = "auth";
 
@@ -104,7 +105,7 @@ fn extract_token(headers: &HeaderMap, jar: &CookieJar) -> Option<String> {
 /// Runs before every protected request: validates the session, loads the
 /// user and inserts it into the request extensions.
 pub async fn require_auth(State(state): State<ServerState>, jar: CookieJar, mut req: Request, next: Next) -> ApiResult<Response> {
-    let token = extract_token(req.headers(), &jar).ok_or(unauthorized("Unauthorized", ""))?;
+    let token = extract_token(req.headers(), &jar).ok_or(unauthorized("Unauthorized", "Authentication is required"))?;
 
     let user = sqlx::query_as::<_, User>(
         "SELECT u.id, u.username, u.role, u.gns3_project_id
@@ -206,6 +207,14 @@ pub struct LoginResponse {
     token: String,
 }
 
+#[derive(FromRow)]
+struct UserWithHash {
+    id: Uuid,
+    username: String,
+    role: Role,
+    password_hash: String,
+}
+
 pub async fn login(State(state): State<ServerState>, jar: CookieJar, Json(body): Json<LoginRequest>) -> ApiResult<(CookieJar, Json<LoginResponse>)> {
     let row = sqlx::query_as::<_, UserWithHash>(
         "SELECT id, username, role, password_hash FROM users WHERE username = ?1",
@@ -234,10 +243,7 @@ pub async fn login(State(state): State<ServerState>, jar: CookieJar, Json(body):
         .max_age(time::Duration::seconds(SESSION_TTL_SECS))
         .build();
 
-    let connector = CONNECTOR.clone();
-    let Some(project) = connector.get_project(Lookup::Name(&project_name(row.username.as_str()))).await? else {
-        return Err(internal_error("No associated GNS3 project", "Please contact admins"));
-    };
+    let project = get_user_project(row.username.as_str()).await?;
 
     let user = User {
         id: row.id,

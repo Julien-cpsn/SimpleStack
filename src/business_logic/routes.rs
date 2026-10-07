@@ -41,15 +41,15 @@ pub fn define_routes(server_state: ServerState) -> Router {
 
     let admin = Router::new()
         .route_with_map(&mut routes, "/new-user", post(create_user))
-        .route_with_map(&mut routes, "/project-summary", get(get_project_summary))
+        .route_with_map(&mut routes, "/projects-summary", get(get_project_summary))
         .route_layer(middleware::from_fn(require_admin));
 
     let protected = Router::new()
-        .route_with_map(&mut routes, "/", get(|| async { "Hello, World!" }))
+        .route_with_map(&mut routes, "/me", get(me))
+        .route_with_map(&mut routes, "/logout", post(logout))
         .route_with_map(&mut routes, "/my-images", get(list_user_images))
         .route_with_map(&mut routes, "/upload-image", post(upload_image))
-        .route_with_map(&mut routes, "/logout", post(logout))
-        .route_with_map(&mut routes, "/me", get(me))
+        //.route_with_map(&mut routes, "/delete-image/{uuid}", get(delete_image))
         .merge(admin)
         .route_layer(middleware::from_fn_with_state(server_state.clone(), require_auth))
         .layer(cors)
@@ -58,7 +58,8 @@ pub fn define_routes(server_state: ServerState) -> Router {
         .layer(TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, Duration::from_secs(60)));
 
     let router = Router::new()
-        .route("/login", post(login))
+        .route_with_map(&mut routes, "/login", post(login))
+        .route_with_map(&mut routes, "/", get(|| async { "Hello, World!" }))
         .merge(protected)
         .with_state(server_state);
 

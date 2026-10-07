@@ -12,7 +12,6 @@ pub struct Model {
     /// File name as stored by GNS3 (unique: GNS3 identifies images by name).
     #[sea_orm(unique)]
     pub filename: String,
-    pub stored_path: String,
     pub size_bytes: i64,
     /// `None` if the uploading user was deleted later.
     pub uploaded_by: Option<Uuid>,

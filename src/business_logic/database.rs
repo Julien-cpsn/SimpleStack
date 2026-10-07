@@ -25,7 +25,6 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE TABLE IF NOT EXISTS os_images (
     id          BLOB PRIMARY KEY,
     filename    TEXT NOT NULL UNIQUE,
-    stored_path TEXT NOT NULL,
     size_bytes  INTEGER NOT NULL,
     architecture TEXT NOT NULL,
     uploaded_by BLOB REFERENCES users(id) ON DELETE SET NULL,
